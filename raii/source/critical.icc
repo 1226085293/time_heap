@@ -1,0 +1,8 @@
+inline critical::critical(CRITICAL_SECTION* crit) {
+	_crit = crit;
+	EnterCriticalSection(_crit);
+}
+
+inline critical::~critical() {
+	LeaveCriticalSection(_crit);
+}

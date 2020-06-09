@@ -1,0 +1,115 @@
+inline time_heap::event::event(intptr_t origin_, uint64_t ms_, uint32_t count_, std::function<void()>&& func_) :
+	_origin(origin_),
+	_ms(ms_),
+	_count(count_),
+	_func(std::move(func_))
+{};
+
+inline void time_heap::event::del() {
+	auto timer = &time_heap::instance();
+	raii::critical r1(&timer->_cri);
+	uint32_t index = static_cast<uint32_t>((_origin - reinterpret_cast<intptr_t>(&timer->_heap[1].ms)) / sizeof(node) + 1);
+	timer->del_timer(index);
+}
+
+template <class T>
+inline time_heap::result_data<T>::result_data(uint32_t count_, std::shared_ptr<std::packaged_task<T()>> pack_func_) :
+	_info(nullptr),
+	_pack_func(pack_func_),
+	valid(true),
+	count(count_)
+{}
+
+template <class T>
+inline T time_heap::result_data<T>::get() {
+	return _pack_func->get_future().get();
+}
+
+template <class T>
+void time_heap::result_data<T>::del() {
+	if (valid) {
+		valid = false;
+		_info->del();
+		return;
+	}
+}
+
+inline time_heap::node::node(node&& that_) {
+	memcpy_s(this, sizeof(node), &that_, sizeof(node));
+	this->info->_origin = reinterpret_cast<intptr_t>(&this->info);
+	memset(&that_, 0, sizeof(node));
+}
+
+inline time_heap::node& time_heap::node::operator =(const node& that_) {
+	if (&that_ == this) {
+		return *this;
+	}
+	memcpy_s(this, sizeof(node), &that_, sizeof(node));
+	this->info->_origin = reinterpret_cast<intptr_t>(&this->info);
+	return *this;
+}
+
+inline time_heap::node& time_heap::node::operator =(node&& that_) {
+	if (&that_ == this) {
+		return *this;
+	}
+	memcpy_s(this, sizeof(node), &that_, sizeof(node));
+	this->info->_origin = reinterpret_cast<intptr_t>(&this->info);
+	memset(&that_, 0, sizeof(node));
+	return *this;
+}
+
+inline void time_heap::del_timer(uint32_t index_) {
+	raii::critical r1(&_cri);
+	if (_size < index_) {
+		return;
+	}
+	delete _heap[index_].info;
+	del_node(index_);
+}
+
+inline void time_heap::reset_timer(uint32_t index_) {
+	raii::critical r1(&_cri);
+	auto timer = std::move(_heap[index_]);
+	timer.ms = get_ms() + timer.info->_ms * 1000;	//结束时间
+	del_node(index_);
+	_heap[_size + 1] = std::move(timer);
+	add_node();
+}
+
+inline uint64_t time_heap::get_ms() {
+	return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+template<class Func, class... Args>
+auto time_heap::add(double second_, uint32_t count_, Func&& func_, Args&& ... args_) {
+	raii::critical r1(&_cri);
+	auto current_size = _size + 1;
+	if (current_size == _max_size) {
+		expansion();
+	}
+	using	re_t = typename std::invoke_result<Func, Args...>::type;																	//回调函数返回类型
+	auto	task = std::make_shared<std::packaged_task<re_t()>>(std::bind(std::forward<Func>(func_), std::forward<Args>(args_)...));	//已包装回调函数指针
+	std::shared_ptr<result_data<re_t>>	result		= std::make_shared<result_data<re_t>>(count_, task);//返回数据
+	uint64_t							mini_time	= _heap[1].ms;										//最小时间
+	// 添加节点
+	_heap[current_size].ms = get_ms() + static_cast<int64_t>(second_) * 1000;	//结束时间
+	_heap[current_size].info = new event(reinterpret_cast<intptr_t>(&_heap[current_size].ms), static_cast<uint64_t>(second_), count_, [=]() {
+		(*task)();
+		if (--result->count == 0) {
+			result->valid = false;
+		}
+		else {
+			task->reset();
+		}
+		}
+	);
+	result->_info = _heap[current_size].info;
+	add_node();
+	// 决定是否唤醒
+	if (mini_time != _heap[current_size].ms) {
+		SetEvent(_event);
+		_event_time = get_ms();
+	}
+	return result;
+}
